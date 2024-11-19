@@ -75,16 +75,31 @@ should_exit = False     # Flag for graceful exit
 total_files_transferred = 0
 transfer_start_time = None
 file_progress_bars = {}  # Dictionary to store progress bars for each file
+overall_progress_bar = None  # Global reference to overall progress bar
+file_positions = {}  # Dictionary to store fixed positions for each file
+completed_files = set()  # Keep track of completed files
+
+def cleanup_progress_bars():
+    """Clean up all progress bars and move cursor to appropriate position."""
+    global file_progress_bars, completed_files
+    
+    if overall_progress_bar:
+        overall_progress_bar.close()
+    
+    # Close any remaining progress bars
+    for pbar in file_progress_bars.values():
+        pbar.close()
+    file_progress_bars.clear()
+    completed_files.clear()
+    
+
 
 def signal_handler(signum, frame):
     """Handle system signals (SIGINT, SIGTERM) for graceful exit."""
     global should_exit
     print("\nReceived signal to exit. Cleaning up...")
+    cleanup_progress_bars()
     should_exit = True
-
-# Register signal handlers for graceful exit
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
 def log(line, level="INFO"):
     """
@@ -106,12 +121,34 @@ def format_size(size):
         size /= 1024.0
     return f"{size:.1f}PB"
 
+def update_overall_progress():
+    """Update the overall progress display."""
+    global overall_progress_bar
+    
+    if len(file_list) > 1 and overall_progress_bar:
+        elapsed_time = time.time() - transfer_start_time
+        overall_progress_bar.set_description_str(f"Overall Progress: {total_files_transferred}/{len(file_list)} files [{elapsed_time:.0f}s elapsed]")
+        overall_progress_bar.refresh()
+        
+        if total_files_transferred == len(file_list):
+            cleanup_progress_bars()
+
+def log_progress_state():
+    """Log the current state of progress tracking variables in debug mode."""
+    if debug_mode:
+        log("=== Progress Tracking State ===", "DEBUG")
+        log(f"file_positions: {file_positions}", "DEBUG")
+        log(f"file_progress_bars keys: {list(file_progress_bars.keys())}", "DEBUG")
+        log(f"completed_files: {completed_files}", "DEBUG")
+        log(f"total_files_transferred: {total_files_transferred}/{len(file_list)}", "DEBUG")
+        log("===========================", "DEBUG")
+
 def process_file_range_command(data_size):
     """
     Process a file range transfer request from the Switch.
     Handles the transfer of a specific portion of a file.
     """
-    global file_list, should_exit, total_files_transferred, transfer_start_time, file_progress_bars
+    global file_list, should_exit, total_files_transferred, transfer_start_time, file_progress_bars, overall_progress_bar, file_positions, completed_files
 
     if transfer_start_time is None:
         transfer_start_time = time.time()
@@ -125,6 +162,11 @@ def process_file_range_command(data_size):
     nsp_name_len = struct.unpack('<I', file_range_header[12:16])[0]
     nsp_name = bytes(file_range_header[16:]).decode('utf-8')
 
+    # Skip if file is already completed
+    if nsp_name in completed_files:
+        log(f'Skipping completed file: {nsp_name}', "DEBUG")
+        return
+
     log(f'Range Size: {range_size}, Range Offset: {range_offset}, Name len: {nsp_name_len}', "DEBUG")
 
     response_bytes = struct.pack('<4sIII', b'DBI0', CMD_TYPE_RESPONSE, CMD_ID_FILE_RANGE, range_size)
@@ -137,7 +179,6 @@ def process_file_range_command(data_size):
     data_size = struct.unpack('<I', ack[12:16])[0]
 
     with open(file_list[nsp_name].__str__(), 'rb') as f:
-        # Get file size information
         total_size = f.seek(0, 2)
         f.seek(range_offset)
         
@@ -145,53 +186,60 @@ def process_file_range_command(data_size):
         end_off = range_size
         read_size = BUFFER_SEGMENT_DATA_SIZE
 
-        # Create or get existing progress bar
-        if nsp_name not in file_progress_bars:
-            progress_desc = f"[{total_files_transferred + 1}/{len(file_list)}] {nsp_name}"
+        if nsp_name not in file_progress_bars and nsp_name not in completed_files:
+            progress_desc = f"[{file_positions[nsp_name]}] {nsp_name}"
             file_progress_bars[nsp_name] = tqdm(
                 total=total_size,
                 unit='B',
                 unit_scale=True,
                 desc=progress_desc,
-                ncols=100,
-                initial=range_offset
+                initial=range_offset,
+                bar_format='{desc}: {percentage:3.1f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                position=file_positions[nsp_name],
+                leave=False
             )
+
+        if nsp_name in file_progress_bars:
+            pbar = file_progress_bars[nsp_name]
             
-            # Show overall progress for multiple files
-            if len(file_list) > 1:
-                elapsed_time = time.time() - transfer_start_time
-                overall_desc = (
-                    f"Overall Progress: {total_files_transferred}/{len(file_list)} files "
-                    f"({total_files_transferred/len(file_list)*100:.1f}%) "
-                    f"[{elapsed_time:.0f}s elapsed]"
-                )
-                print(overall_desc)
+            while curr_off < end_off and not should_exit:
+                if curr_off + read_size >= end_off:
+                    read_size = end_off - curr_off
+                buf = f.read(read_size)
+                out_ep.write(data=buf, timeout=0)
+                curr_off += read_size
+                pbar.update(read_size)
 
-        pbar = file_progress_bars[nsp_name]
-        
-        while curr_off < end_off and not should_exit:
-            if curr_off + read_size >= end_off:
-                read_size = end_off - curr_off
-            buf = f.read(read_size)
-            out_ep.write(data=buf, timeout=0)
-            curr_off += read_size
-            pbar.update(read_size)
-
-        # Close and remove progress bar if file is complete
-        if range_offset + range_size >= total_size:
-            pbar.close()
-            del file_progress_bars[nsp_name]
-            total_files_transferred += 1
+            if range_offset + range_size >= total_size:
+                pbar.close()
+                del file_progress_bars[nsp_name]
+                completed_files.add(nsp_name)
+                if total_files_transferred < len(file_list):
+                    total_files_transferred += 1
+                    update_overall_progress()
+                    log_progress_state()
 
 def poll_commands():
     """
     Main command polling loop.
     Continuously listens for commands from the Switch and processes them.
-    Handles file transfers, list requests, and exit commands.
     """
-    log('Entering command loop')
-    global should_exit
+    global transfer_start_time, should_exit, overall_progress_bar, file_positions
+
+    transfer_start_time = time.time()
     
+    # Assign fixed positions to each file at the start
+    for i, filename in enumerate(file_list.keys()):
+        file_positions[filename] = i + 1  # Position 0 is reserved for overall progress
+        
+    if len(file_list) > 1:
+        overall_progress_bar = tqdm(
+            total=0,  # No need for progress in overall bar
+            bar_format='{desc}',
+            position=0,  # Keep at top
+            desc=f"Overall Progress: 0/{len(file_list)} files [0s elapsed]"
+        )
+
     while not should_exit:
         try:
             # Read command header from Switch
@@ -422,4 +470,6 @@ def main():
         log("Transfer completed successfully")
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     main()
