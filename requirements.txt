@@ -1,0 +1,14 @@
+# Core USB communication
+pyusb>=1.2.1
+libusb>=1.0.26b5
+
+# CLI and Progress Bar
+tqdm>=4.66.1
+argparse>=1.4.0
+
+# Utility
+six>=1.16.0
+pathlib>=1.0.1
+
+# Optional but recommended
+colorama>=0.4.6
