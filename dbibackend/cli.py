@@ -17,7 +17,7 @@ Options:
     --timeout        USB timeout in milliseconds (default: 0)
 """
 
-# This script can be run without activate virtual env : uv run dbibackend.py
+# This script can be run without activate virtual env : uv run cli.py
 # This script has inline dependencies, it will ignore the project toml file
 
 # /// script
