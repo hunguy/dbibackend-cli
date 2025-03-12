@@ -27,8 +27,8 @@ Options:
 #     "pyusb>=1.2.1",           # USB communication with the Switch
 #     "libusb>=1.0.26b5",       # Required by pyusb for USB access
 #     
-#     # CLI and Progress Bar
-#     "tqdm>=4.66.1",           # Progress bars for file transfers
+#     # CLI and Rich UI
+#     "rich>=13.7.0",           # Rich text and beautiful formatting in the terminal
 #     "argparse>=1.4.0",        # Command line argument parsing
 #     
 #     # Utility
@@ -48,7 +48,10 @@ import time
 import threading
 import signal
 import argparse
-from tqdm import tqdm
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.live import Live
 from binascii import hexlify as hx, unhexlify as uhx
 from pathlib import Path
 
@@ -75,88 +78,198 @@ should_exit = False     # Flag for graceful exit
 progress_manager = None
 
 class ProgressManager:
-    """Manages progress bars for file transfers."""
+    """Manages Rich table display for file transfers."""
     def __init__(self, file_list, debug_mode=False):
         self.file_list = file_list
         self.debug_mode = debug_mode
         self.file_positions = {filename: i + 1 for i, filename in enumerate(file_list.keys())}
-        self.file_progress_bars = {}
+        self.file_progress = {}  # Stores progress data for each file
         self.completed_files = set()
         self.total_files_transferred = 0
         self.transfer_start_time = None
-        self.overall_progress_bar = None
-
+        self.console = Console()
+        self.live = None
+        self.table = None
+        
+        # Create the initial table
+        self._create_table()
+        
+    def _create_table(self):
+        """Create a Rich table for displaying file transfer progress."""
+        from rich.box import SIMPLE
+        
+        table = Table(title="DBI File Transfer Progress", box=SIMPLE)
+        
+        # Add columns with different colors (same color for header and cells)
+        table.add_column("#", style="cyan", header_style="cyan", justify="right")
+        table.add_column("Filename", style="green", header_style="green")
+        table.add_column("Progress", style="yellow", header_style="yellow")
+        table.add_column("Size", style="blue", header_style="blue", justify="right")
+        table.add_column("Time Elapsed", style="magenta", header_style="magenta", justify="right")
+        table.add_column("Time Remaining", style="red", header_style="red", justify="right")
+        
+        self.table = table
+        
     def start_transfer(self):
-        """Initialize transfer and create overall progress bar."""
+        """Initialize transfer and create live display."""
         self.transfer_start_time = time.time()
-        if len(self.file_list) > 1:
-            self.overall_progress_bar = tqdm(
-                total=0,
-                bar_format='{desc}',
-                position=0,
-                desc=f"Overall Progress: 0/{len(self.file_list)} files [0s elapsed]"
-            )
+        self.live = Live(self.table, refresh_per_second=4)
+        self.live.start()
+        
+        # Add a header row with overall progress
+        self._update_overall_progress()
 
     def create_progress_bar(self, filename, total_size, initial_offset=0):
-        """Create a progress bar for a file if it doesn't exist."""
-        if filename not in self.file_progress_bars and filename not in self.completed_files:
-            progress_desc = f"[{self.file_positions[filename]}] {filename}"
-            self.file_progress_bars[filename] = tqdm(
-                total=total_size,
-                unit='B',
-                unit_scale=True,
-                desc=progress_desc,
-                initial=initial_offset,
-                bar_format='{desc}: {percentage:3.1f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
-                position=self.file_positions[filename],
-                leave=False
-            )
-            return self.file_progress_bars[filename]
-        return self.file_progress_bars.get(filename)
+        """Initialize progress tracking for a file."""
+        if filename not in self.file_progress and filename not in self.completed_files:
+            self.file_progress[filename] = {
+                'total_size': total_size,
+                'current': initial_offset,
+                'start_time': time.time(),
+                'last_update_time': time.time(),
+                'last_update_size': initial_offset,
+                'speed': 0  # bytes per second
+            }
+            
+            # Update the table with the new file
+            self._update_table()
+            
+            return True
+        return filename in self.file_progress
 
     def update_progress(self, filename, bytes_transferred):
         """Update progress for a file."""
-        if filename in self.file_progress_bars:
-            self.file_progress_bars[filename].update(bytes_transferred)
+        if filename in self.file_progress:
+            progress = self.file_progress[filename]
+            progress['current'] += bytes_transferred
+            
+            # Calculate transfer speed
+            current_time = time.time()
+            time_diff = current_time - progress['last_update_time']
+            if time_diff >= 0.5:  # Update speed calculation every 0.5 seconds
+                size_diff = progress['current'] - progress['last_update_size']
+                progress['speed'] = size_diff / time_diff
+                progress['last_update_time'] = current_time
+                progress['last_update_size'] = progress['current']
+                
+                # Update the table
+                self._update_table()
 
     def complete_file(self, filename):
         """Mark a file as complete and update overall progress."""
-        if filename in self.file_progress_bars:
-            self.file_progress_bars[filename].close()
-            del self.file_progress_bars[filename]
+        if filename in self.file_progress:
+            # Ensure progress shows 100%
+            self.file_progress[filename]['current'] = self.file_progress[filename]['total_size']
+            
+            # Move to completed set
             self.completed_files.add(filename)
+            del self.file_progress[filename]
+            
             if self.total_files_transferred < len(self.file_list):
                 self.total_files_transferred += 1
                 self._update_overall_progress()
+                self._update_table()
                 self._log_progress_state()
 
-    def _update_overall_progress(self):
-        """Update the overall progress display."""
-        if len(self.file_list) > 1 and self.overall_progress_bar:
-            elapsed_time = time.time() - self.transfer_start_time
-            self.overall_progress_bar.set_description_str(
-                f"Overall Progress: {self.total_files_transferred}/{len(self.file_list)} files [{elapsed_time:.0f}s elapsed]"
+    def _update_table(self):
+        """Update the Rich table with current progress information."""
+        if not self.live:
+            return
+            
+        # Clear the table and recreate it
+        self._create_table()
+        
+        # Add overall progress row
+        self._update_overall_progress()
+        
+        # Add rows for in-progress files
+        for filename, progress in sorted(self.file_progress.items(), key=lambda x: self.file_positions[x[0]]):
+            position = self.file_positions[filename]
+            current = progress['current']
+            total = progress['total_size']
+            percent = (current / total) * 100 if total > 0 else 0
+            
+            # Calculate progress bar (20 chars wide)
+            bar_width = 20
+            completed_width = int(bar_width * percent / 100)
+            progress_bar = f"[{'#' * completed_width}{'-' * (bar_width - completed_width)}] {percent:.1f}%"
+            
+            # Calculate elapsed time
+            elapsed_seconds = time.time() - progress['start_time']
+            elapsed = self._format_time(elapsed_seconds)
+            
+            # Calculate remaining time based on current speed
+            if progress['speed'] > 0:
+                remaining_bytes = total - current
+                remaining_seconds = remaining_bytes / progress['speed']
+                remaining = self._format_time(remaining_seconds)
+            else:
+                remaining = "Unknown"
+                
+            # Add the row to the table
+            self.table.add_row(
+                str(position),
+                filename,
+                progress_bar,
+                format_size(total),
+                elapsed,
+                remaining
             )
-            self.overall_progress_bar.refresh()
+            
+        # Add rows for completed files
+        for filename in sorted(self.completed_files, key=lambda x: self.file_positions[x]):
+            position = self.file_positions[filename]
+            total = self.file_list[filename].stat().st_size
+            
+            self.table.add_row(
+                str(position),
+                f"[bold green]{filename} (Completed)[/bold green]",
+                "[bold green][####################] 100.0%[/bold green]",
+                format_size(total),
+                "Completed",
+                "-"
+            )
+            
+        # Update the live display
+        self.live.update(self.table)
+
+    def _update_overall_progress(self):
+        """Update the overall progress information in the table title."""
+        if self.transfer_start_time:
+            elapsed_time = time.time() - self.transfer_start_time
+            self.table.title = f"DBI File Transfer Progress - {self.total_files_transferred}/{len(self.file_list)} files completed [{self._format_time(elapsed_time)} elapsed]"
+
+    def _format_time(self, seconds):
+        """Format seconds into a human-readable time string."""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            minutes = seconds // 60
+            seconds %= 60
+            return f"{minutes:.0f}m {seconds:.0f}s"
+        else:
+            hours = seconds // 3600
+            seconds %= 3600
+            minutes = seconds // 60
+            return f"{hours:.0f}h {minutes:.0f}m"
 
     def _log_progress_state(self):
         """Log the current state of progress tracking variables in debug mode."""
         if self.debug_mode:
             log("=== Progress Tracking State ===", "DEBUG")
             log(f"file_positions: {self.file_positions}", "DEBUG")
-            log(f"file_progress_bars keys: {list(self.file_progress_bars.keys())}", "DEBUG")
+            log(f"file_progress keys: {list(self.file_progress.keys())}", "DEBUG")
             log(f"completed_files: {self.completed_files}", "DEBUG")
             log(f"total_files_transferred: {self.total_files_transferred}/{len(self.file_list)}", "DEBUG")
             log("===========================", "DEBUG")
 
     def cleanup(self):
-        """Clean up all progress bars."""
-        if self.overall_progress_bar:
-            self.overall_progress_bar.close()
+        """Clean up the live display."""
+        if self.live:
+            self.live.stop()
+            self.live = None
         
-        for pbar in self.file_progress_bars.values():
-            pbar.close()
-        self.file_progress_bars.clear()
+        self.file_progress.clear()
         self.completed_files.clear()
 
     def is_file_completed(self, filename):
@@ -170,14 +283,17 @@ def cleanup_progress_bars():
 
 def signal_handler(signum, frame):
     """Handle system signals (SIGINT, SIGTERM) for graceful exit."""
-    global should_exit
-    print("\nReceived signal to exit. Cleaning up...")
+    global should_exit, console
+    console.print("\n[bold red]Received signal to exit. Cleaning up...[/bold red]")
     cleanup_progress_bars()
     should_exit = True
 
+# Create a global console for Rich output
+console = Console()
+
 def log(line, level="INFO"):
     """
-    Log messages with different severity levels.
+    Log messages with different severity levels using Rich formatting.
     
     Args:
         line (str): Message to log
@@ -185,7 +301,17 @@ def log(line, level="INFO"):
     """
     if level == "DEBUG" and not debug_mode:
         return
-    print(f"[{level}] {line}")
+        
+    # Define colors for different log levels
+    level_styles = {
+        "INFO": "bold blue",
+        "DEBUG": "dim white",
+        "ERROR": "bold red",
+        "WARNING": "bold yellow"
+    }
+    
+    style = level_styles.get(level, "white")
+    console.print(f"[{style}][{level}][/] {line}")
 
 def format_size(size):
     """Format size in bytes to human readable format."""
@@ -294,7 +420,7 @@ def poll_commands():
 
 def process_exit_command():
     """Handle exit command from Switch by sending acknowledgment and setting exit flag."""
-    log('Received exit command')
+    log('\nReceived exit command')
     out_ep.write(struct.pack('<4sIII', b'DBI0', CMD_TYPE_RESPONSE, CMD_ID_EXIT, 0))
     global should_exit
     should_exit = True
@@ -487,9 +613,9 @@ def main():
                 sys.exit(1)
 
     if should_exit:
-        log("Transfer interrupted by user")
+        console.print("[bold yellow]Transfer interrupted by user[/bold yellow]")
     else:
-        log("Transfer completed successfully")
+        console.print("[bold green]Transfer completed successfully[/bold green]")
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
