@@ -12,3 +12,6 @@ pathlib>=1.0.1
 
 # Optional but recommended
 colorama>=0.4.6
+
+# call nsz to unzip first if needed
+nsz>=4.6.1
